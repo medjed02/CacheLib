@@ -62,7 +62,7 @@ struct ReadHandleImpl {
   /*implicit*/ ReadHandleImpl(std::nullptr_t) {}
 
   // reset the handle by releasing the item it holds.
-  void reset() noexcept {
+  FOLLY_ALWAYS_INLINE void reset() noexcept {
     // Guard the shared_ptr reset: the vast majority of handles point
     // directly at a DRAM item and have no wait context, so avoid the
     // unconditional shared_ptr swap machinery in that common path.
@@ -78,8 +78,7 @@ struct ReadHandleImpl {
     try {
       alloc_->release(it_, isNascent());
     } catch (const std::exception& e) {
-      XLOGF(CRITICAL, "Failed to release {} : {}", static_cast<void*>(it_),
-            e.what());
+      logReleaseFailure(it_, e);
     }
     it_ = nullptr;
   }
@@ -97,7 +96,7 @@ struct ReadHandleImpl {
     return ret;
   }
 
-  ~ReadHandleImpl() noexcept { reset(); }
+  FOLLY_ALWAYS_INLINE ~ReadHandleImpl() noexcept { reset(); }
 
   ReadHandleImpl(const ReadHandleImpl&) = delete;
   ReadHandleImpl& operator=(const ReadHandleImpl&) = delete;
@@ -492,6 +491,13 @@ struct ReadHandleImpl {
   void cloneFlags(const ReadHandleImpl& other) {
     flags_ = other.getFlags();
     ttaSecs_ = other.getTTASecs();
+  }
+
+  // Out of line so that the logging code does not bloat every inlined reset().
+  FOLLY_NOINLINE static void logReleaseFailure(
+      Item* item, const std::exception& error) noexcept {
+    XLOGF(CRITICAL, "Failed to release {} : {}", static_cast<void*>(item),
+          error.what());
   }
 
   Item* releaseItem() noexcept { return std::exchange(it_, nullptr); }

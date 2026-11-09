@@ -18,7 +18,10 @@
 
 #include <fmt/core.h>
 #include <folly/Optional.h>
+#include <folly/synchronization/SanitizeThread.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -150,6 +153,34 @@ class ChainedHashTable {
 
     // gets the bucket for the key by using the corresponding hash function.
     BucketId getBucket(Key k) const noexcept;
+
+    // Prefetches the bucket slot. Batched lookups call this for every key
+    // first so that the slot cache misses of the whole batch overlap.
+    void prefetchBucket(BucketId bucket) const noexcept {
+      __builtin_prefetch(hashTable_.get() + bucket);
+    }
+
+    // Prefetches the first node of the bucket's chain. The slot is read without
+    // the bucket lock, so the address may be stale: it is only prefetched,
+    // never dereferenced. 4-byte pointers only, a 5-byte read could tear.
+    void prefetchBucketHead(BucketId bucket) const noexcept {
+      if constexpr (sizeof(CompressedPtrType) == sizeof(uint32_t)) {
+        uint32_t raw;
+        {
+          folly::annotate_ignore_thread_sanitizer_guard g(__FILE__, __LINE__);
+          raw = __atomic_load_n(
+              reinterpret_cast<const uint32_t*>(hashTable_.get() + bucket),
+              __ATOMIC_RELAXED);
+        }
+        const CompressedPtrType head{
+            static_cast<typename CompressedPtrType::SerializedPtrType>(raw)};
+        if (const T* node = compressor_.unCompress(head)) {
+          __builtin_prefetch(node);
+        }
+      } else {
+        (void)bucket;
+      }
+    }
 
     // Call 'func' on each element in the given bucket.
     //
@@ -515,6 +546,17 @@ class ChainedHashTable {
     // @throw std::overflow_error is the maximum item refcount is execeeded by
     //        creating this item handle.
     Handle find(Key key) const;
+
+    // Batched find(): handles[i] = makeHandle(<node for keys[i] or nullptr>),
+    // with the bucket slots and chain heads prefetched ahead of the lookups.
+    //
+    // @param keys        keys to look up
+    // @param handles     output, same size as keys
+    // @param makeHandle  converts a T* (possibly nullptr) to OutputHandle
+    template <typename OutputHandle, typename MakeHandle>
+    void findMany(folly::Range<const Key*> keys,
+                  folly::Range<OutputHandle*> handles,
+                  MakeHandle&& makeHandle) const;
 
     // for saving the state of the hash table
     //
@@ -1316,6 +1358,41 @@ typename T::Handle ChainedHashTable::Container<T, HookPtr, LockT>::find(
   const auto bucket = ht_.getBucket(key);
   auto l = locks_.lockShared(bucket);
   return handleMaker_(ht_.findInBucket(key, bucket));
+}
+
+template <typename T,
+          typename ChainedHashTable::Hook<T> T::* HookPtr,
+          typename LockT>
+template <typename OutputHandle, typename MakeHandle>
+void ChainedHashTable::Container<T, HookPtr, LockT>::findMany(
+    folly::Range<const Key*> keys,
+    folly::Range<OutputHandle*> handles,
+    MakeHandle&& makeHandle) const {
+  XDCHECK_EQ(keys.size(), handles.size());
+  // Bucket slots are prefetched kBatch keys ahead, chain heads kGroup keys
+  // ahead: a head can only be decoded once its slot has arrived.
+  constexpr size_t kBatch = 32;
+  constexpr size_t kGroup = 16;
+  std::array<BucketId, kBatch> buckets;
+  for (size_t base = 0; base < keys.size(); base += kBatch) {
+    const size_t n = std::min(kBatch, keys.size() - base);
+    for (size_t i = 0; i < n; ++i) {
+      buckets[i] = ht_.getBucket(keys[base + i]);
+      ht_.prefetchBucket(buckets[i]);
+    }
+    for (size_t group = 0; group < n; group += kGroup) {
+      const size_t end = std::min(n, group + kGroup);
+      for (size_t i = group; i < end; ++i) {
+        ht_.prefetchBucketHead(buckets[i]);
+      }
+      for (size_t i = group; i < end; ++i) {
+        handles[base + i] = [&] {
+          auto l = locks_.lockShared(buckets[i]);
+          return makeHandle(ht_.findInBucket(keys[base + i], buckets[i]));
+        }();
+      }
+    }
+  }
 }
 
 template <typename T,

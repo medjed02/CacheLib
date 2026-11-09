@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#include <folly/Random.h>
+
+#include <algorithm>
+
 #include "cachelib/allocator/ChainedHashTable.h"
 #include "cachelib/allocator/tests/AccessTypeTest.h"
 #include "cachelib/shm/HugePageTestUtils.h"
@@ -81,6 +85,46 @@ TEST_F(ChainedHashTest, Chaining) {
   for (const auto& node : nodes) {
     auto handle = c.find(node->getKey());
     ASSERT_TRUE(handle);
+  }
+}
+
+TEST_F(ChainedHashTest, FindMany) {
+  // 32 buckets for 2000 nodes: long chains, and batches hit the same bucket.
+  Container c{Config{5, 3}, typename Node::PtrCompressor()};
+  std::vector<std::unique_ptr<Node>> nodes;
+  for (unsigned int i = 0; i < 2000; i++) {
+    nodes.emplace_back(new Node(getRandomNewKey(c)));
+    c.insert(*nodes.back());
+  }
+  auto makeHandle = [](Node* node) {
+    if (node) {
+      node->incRef();
+    }
+    return typename Node::Handle(node);
+  };
+
+  for (size_t batch : {0, 1, 16, 17, 32, 33, 100}) {
+    std::vector<std::string> storage;
+    for (size_t i = 0; i < batch; ++i) {
+      storage.push_back(i % 3 == 0 ? getRandomNewKey(c)
+                                   : nodes[folly::Random::rand32(nodes.size())]
+                                         ->getKey()
+                                         .str());
+    }
+    std::vector<typename Node::Key> keys(storage.begin(), storage.end());
+    std::vector<typename Node::Handle> handles(batch);
+    c.findMany(folly::range(keys), folly::range(handles), makeHandle);
+    for (size_t i = 0; i < batch; ++i) {
+      auto expected = c.find(keys[i]);
+      ASSERT_EQ(expected.get(), handles[i].get());
+      if (handles[i]) {
+        EXPECT_EQ(keys[i], handles[i]->getKey());
+        // one reference per findMany handle for this key, one from find
+        const auto copies = std::count(keys.begin(), keys.end(), keys[i]);
+        EXPECT_EQ(static_cast<unsigned int>(copies + 1),
+                  handles[i]->getRefCount());
+      }
+    }
   }
 }
 

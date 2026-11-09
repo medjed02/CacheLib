@@ -590,6 +590,21 @@ class CacheAllocator : public CacheBase {
   //                  key does not exist.
   ReadHandle find(Key key);
 
+  // Looks up several keys at once. Equivalent to handles[i] = find(keys[i])
+  // for every i (same stats, expiry handling and access promotion), but for a
+  // DRAM-only cache the hash table and item cache misses of different keys
+  // overlap instead of being taken one key at a time. With an NVM cache this
+  // falls back to find() for each key.
+  //
+  // @param keys     the keys to look up
+  // @param handles  output, the same size as keys; every handle must be empty
+  //
+  // @throw std::invalid_argument if the sizes differ or a handle is not empty
+  // @throw std::overflow_error if the maximum item refcount is exceeded by
+  //        creating a handle
+  void findMany(folly::Range<const Key*> keys,
+                folly::Range<ReadHandle*> handles);
+
   // Warning: this API is synchronous today with HybridCache. This means as
   //          opposed to find(), we will block on an item being read from
   //          flash until it is loaded into DRAM-cache. In find(), if an item
@@ -1538,6 +1553,7 @@ class CacheAllocator : public CacheBase {
  private:
   // wrapper around Item's refcount and active handle tracking
   FOLLY_ALWAYS_INLINE RefcountWithFlags::IncResult incRef(Item& it);
+  void markUsefulItem(Item& item, AccessMode mode);
   FOLLY_ALWAYS_INLINE RefcountWithFlags::Value decRef(Item& it);
 
   // drops the refcount and if needed, frees the allocation back to the memory
@@ -1594,6 +1610,11 @@ class CacheAllocator : public CacheBase {
   // @throw std::overflow_error is the maximum item refcount is execeeded by
   //        creating this item handle.
   WriteHandle acquire(Item* it);
+
+  // acquire() that builds HandleT directly, so that findMany() does not
+  // convert a WriteHandle into a ReadHandle for every key.
+  template <typename HandleT>
+  HandleT acquireHandle(Item* it);
 
   using TryAcquireResult = typename AccessContainer::TryAcquireResult;
 
@@ -1864,6 +1885,12 @@ class CacheAllocator : public CacheBase {
   // @throw std::overflow_error is the maximum item refcount is execeeded by
   //        creating this item handle.
   WriteHandle findInternalWithExpiration(Key key, AllocatorApiEvent event);
+
+  // findInternalWithExpiration() on the handle returned by lookup(), which
+  // may be a reference to a handle that findMany() has already filled in.
+  template <typename Lookup>
+  auto findWithExpiration(Key key, AllocatorApiEvent event, Lookup&& lookup)
+      -> decltype(lookup());
 
   // look up an item by its key across the nvm cache as well if enabled.
   //
@@ -3904,19 +3931,23 @@ RefcountWithFlags::Value CacheAllocator<CacheTrait>::decRef(Item& it) {
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::WriteHandle
 CacheAllocator<CacheTrait>::acquire(Item* it) {
-  if (UNLIKELY(!it)) {
-    return WriteHandle{};
-  }
+  return acquireHandle<WriteHandle>(it);
+}
 
-  SCOPE_FAIL { stats_.numRefcountOverflow.inc(); };
+template <typename CacheTrait>
+template <typename HandleT>
+HandleT CacheAllocator<CacheTrait>::acquireHandle(Item* it) try {
+  if (UNLIKELY(!it)) {
+    return HandleT{};
+  }
 
   while (true) {
     auto incRes = incRef(*it);
     if (LIKELY(incRes == RefcountWithFlags::IncResult::kIncOk)) {
-      return WriteHandle{it, *this};
+      return HandleT{it, *this};
     } else if (incRes == RefcountWithFlags::IncResult::kIncFailedEviction) {
       // item is being evicted
-      return WriteHandle{};
+      return HandleT{};
     } else {
       // item is being moved - wait for completion
       WriteHandle handle;
@@ -3925,6 +3956,11 @@ CacheAllocator<CacheTrait>::acquire(Item* it) {
       }
     }
   }
+} catch (...) {
+  // A function-try-block rather than SCOPE_FAIL: SCOPE_FAIL queries
+  // std::uncaught_exceptions() on every call, which is out of line.
+  stats_.numRefcountOverflow.inc();
+  throw;
 }
 
 template <typename CacheTrait>
@@ -4965,6 +5001,16 @@ template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::WriteHandle
 CacheAllocator<CacheTrait>::findInternalWithExpiration(
     Key key, AllocatorApiEvent event) {
+  return findWithExpiration(key, event,
+                            [this, key] { return findInternal(key); });
+}
+
+template <typename CacheTrait>
+template <typename Lookup>
+auto CacheAllocator<CacheTrait>::findWithExpiration(Key key,
+                                                    AllocatorApiEvent event,
+                                                    Lookup&& lookup)
+    -> decltype(lookup()) {
   bool needToBumpStats =
       event == AllocatorApiEvent::FIND || event == AllocatorApiEvent::FIND_FAST;
   if (needToBumpStats) {
@@ -4976,8 +5022,9 @@ CacheAllocator<CacheTrait>::findInternalWithExpiration(
           event == AllocatorApiEvent::PEEK)
       << magic_enum::enum_name(event);
 
-  auto handle = findInternal(key);
-  if (UNLIKELY(!handle)) {
+  decltype(auto) handle = lookup();
+  auto* const item = handle.getInternal();
+  if (UNLIKELY(!item)) {
     if (needToBumpStats) {
       stats_.numCacheGetMiss.inc();
       recordEvent(event, key, AllocatorApiResult::NOT_FOUND);
@@ -4985,22 +5032,22 @@ CacheAllocator<CacheTrait>::findInternalWithExpiration(
     return handle;
   }
 
-  if (UNLIKELY(handle->isExpired())) {
+  if (UNLIKELY(item->isExpired())) {
     // update cache miss stats if the item has already been expired.
     if (needToBumpStats) {
       stats_.numCacheGetMiss.inc();
       stats_.numCacheGetExpiries.inc();
       recordEvent(event, key, AllocatorApiResult::EXPIRED, handle);
     }
-    WriteHandle ret;
-    ret.markExpired();
-    return ret;
+    handle = {};
+    handle.markExpired();
+    return handle;
   }
 
   if (needToBumpStats) {
     recordEvent(event, key, AllocatorApiResult::FOUND, handle);
   }
-  auto lastAccess = handle->getLastAccessTime();
+  auto lastAccess = item->getLastAccessTime();
   if (lastAccess > 0) {
     handle.setTTASecs(util::getCurrentTimeSec() - lastAccess);
   }
@@ -5076,13 +5123,52 @@ CacheAllocator<CacheTrait>::find(typename Item::Key key) {
 }
 
 template <typename CacheTrait>
+void CacheAllocator<CacheTrait>::findMany(folly::Range<const Key*> keys,
+                                          folly::Range<ReadHandle*> handles) {
+  if (keys.size() != handles.size()) {
+    throw std::invalid_argument(
+        fmt::format("findMany: {} keys but {} handles", keys.size(),
+                    handles.size()));
+  }
+  for (const auto& handle : handles) {
+    // Not isReady() means an async lookup is in flight; checking it first
+    // also keeps operator bool from waiting for it.
+    if (!handle.isReady() || handle.getInternal() != nullptr) {
+      throw std::invalid_argument("findMany: output handles must be empty");
+    }
+  }
+
+  if (nvmCache_) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+      handles[i] = find(keys[i]);
+    }
+    return;
+  }
+
+  accessContainer_->findMany(keys, handles, [this](Item* item) {
+    return acquireHandle<ReadHandle>(item);
+  });
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto& handle =
+        findWithExpiration(keys[i], AllocatorApiEvent::FIND,
+                           [&]() -> ReadHandle& { return handles[i]; });
+    if (auto* item = handle.getInternal()) {
+      markUsefulItem(*item, AccessMode::kRead);
+    }
+  }
+}
+
+template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::markUseful(const ReadHandle& handle,
                                             AccessMode mode) {
   if (!handle) {
     return;
   }
+  markUsefulItem(*handle.getInternal(), mode);
+}
 
-  auto& item = *(handle.getInternal());
+template <typename CacheTrait>
+void CacheAllocator<CacheTrait>::markUsefulItem(Item& item, AccessMode mode) {
   bool recorded = recordAccessInMMContainer(item, mode);
 
   // if parent is not recorded, skip children as well when the config is set
