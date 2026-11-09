@@ -5148,13 +5148,50 @@ void CacheAllocator<CacheTrait>::findMany(folly::Range<const Key*> keys,
   accessContainer_->findMany(keys, handles, [this](Item* item) {
     return acquireHandle<ReadHandle>(item);
   });
-  for (size_t i = 0; i < keys.size(); ++i) {
-    auto& handle =
-        findWithExpiration(keys[i], AllocatorApiEvent::FIND,
-                           [&]() -> ReadHandle& { return handles[i]; });
-    if (auto* item = handle.getInternal()) {
-      markUsefulItem(*item, AccessMode::kRead);
+
+  // The per-key logic of findWithExpiration(), but the thread-local counters
+  // and the clock are touched once per batch: per key they cost about as much
+  // as the hash table probe of a cached item.
+  const uint32_t now = util::getCurrentTimeSec();
+  uint64_t gets = 0;
+  uint64_t misses = 0;
+  uint64_t expiries = 0;
+  SCOPE_EXIT {
+    stats_.numCacheGets.add(gets);
+    if (misses) {
+      stats_.numCacheGetMiss.add(misses);
     }
+    if (expiries) {
+      stats_.numCacheGetExpiries.add(expiries);
+    }
+  };
+  for (size_t i = 0; i < keys.size(); ++i) {
+    ++gets;
+    auto& handle = handles[i];
+    auto* const item = handle.getInternal();
+    if (UNLIKELY(!item)) {
+      ++misses;
+      recordEvent(AllocatorApiEvent::FIND, keys[i],
+                  AllocatorApiResult::NOT_FOUND);
+      continue;
+    }
+    if (UNLIKELY(item->isExpired(now))) {
+      ++misses;
+      ++expiries;
+      recordEvent(AllocatorApiEvent::FIND, keys[i], AllocatorApiResult::EXPIRED,
+                  handle);
+      handle = {};
+      handle.markExpired();
+      continue;
+    }
+    recordEvent(AllocatorApiEvent::FIND, keys[i], AllocatorApiResult::FOUND,
+                handle);
+    // Another thread may have accessed the item after the clock was read.
+    const auto lastAccess = item->getLastAccessTime();
+    if (lastAccess > 0) {
+      handle.setTTASecs(now > lastAccess ? now - lastAccess : 0);
+    }
+    markUsefulItem(*item, AccessMode::kRead);
   }
 }
 

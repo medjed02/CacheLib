@@ -20,6 +20,7 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "cachelib/allocator/CacheAllocator.h"
@@ -130,6 +131,33 @@ TEST_F(FindManyTest, Expired) {
   const auto after = cache_->getGlobalCacheStats();
   EXPECT_EQ(1, after.numCacheGetExpiries - before.numCacheGetExpiries);
   EXPECT_EQ(1, after.numCacheGetMiss - before.numCacheGetMiss);
+}
+
+TEST_F(FindManyTest, StatsMatchFind) {
+  insert("a");
+  insert("b");
+  insert("expired", 1 /* ttlSecs */, util::getCurrentTimeSec() - 10);
+  const std::vector<Key> keys{"a", "x", "expired", "b", "y", "a", "expired"};
+  const auto deltas = [](const GlobalCacheStats& from,
+                         const GlobalCacheStats& to) {
+    return std::make_tuple(to.numCacheGets - from.numCacheGets,
+                           to.numCacheGetMiss - from.numCacheGetMiss,
+                           to.numCacheGetExpiries - from.numCacheGetExpiries);
+  };
+
+  const auto beforeFind = cache_->getGlobalCacheStats();
+  for (const auto& key : keys) {
+    cache_->find(key);
+  }
+  const auto afterFind = cache_->getGlobalCacheStats();
+
+  std::vector<ReadHandle> handles(keys.size());
+  cache_->findMany(folly::range(keys), folly::range(handles));
+  const auto afterFindMany = cache_->getGlobalCacheStats();
+
+  EXPECT_EQ(deltas(beforeFind, afterFind), deltas(afterFind, afterFindMany));
+  EXPECT_EQ(std::make_tuple(uint64_t{7}, uint64_t{4}, uint64_t{2}),
+            deltas(afterFind, afterFindMany));
 }
 
 TEST_F(FindManyTest, InvalidArguments) {
